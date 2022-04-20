@@ -36,15 +36,19 @@ const db = {
   },
 
   async getChannels(cc) {
-    return await mutex.runExclusive(
-      async () => {
-        const subscriptions = await rdb.get('subscriptions');
-        if (!subscriptions) {
-          return [];
-        }
-        return Object.keys(subscriptions[cc] || {});
-      }
-    );
+    const subscriptions = await rdb.get('subscriptions');
+    if (!subscriptions) {
+      return [];
+    }
+    return Object.keys(subscriptions[cc] || {});
+  },
+
+  async getLiveConnections() {
+    return await rdb.get('connections');
+  },
+
+  async updateLiveConnections(connections) {
+    return await rdb.set('connections', connections);
   },
 };
 
@@ -100,14 +104,13 @@ const server = http.createServer(app);
 
 const wss = new WebSocket.Server({ server });
 
-wss.on('connection', ws => {
-  console.log('received connection');
-  ws.on('message', async (data) => {
-    const { cc, content, sender, timestamp, name } = JSON.parse(data);
-    console.log('%s', data);
-    console.log(cc, sender, content, timestamp);
-
-    const channels = await db.getChannels(cc);
+const socketHandlers = {
+  async CHAT_MESSAGE(data) {
+    // messageType
+    //  CLAN_CHAT = user messages
+    //  CLAN_MESSAGE = loot drops, deaths, etc
+    const { content, sender, timestamp, name, messageType } = data;
+    const channels = await db.getChannels(sender);
     for (const channelId of channels) {
       // API endpoint to send message
       const endpoint = `channels/${channelId}/messages`;
@@ -123,7 +126,73 @@ wss.on('connection', ws => {
         console.error(err);
       }
     }
+  },
+  async CC_CHANGE(data, ws) {
+    const { cc, guest } = data;
+    ws.cc = cc;
+  }
+};
+
+wss.on('connection', ws => {
+  ws.isAlive = true;
+  ws.on('pong', () => ws.isAlive = true);
+  
+  console.log('received connection');
+  ws.on('message', async (data) => {
+    data = JSON.parse(data);
+    console.log(data);
+
+    const handler = socketHandlers[data['type']];
+    if (handler) {
+      handler(data, ws);
+    } else {
+      console.log('no handler for message type', data['type']);
+    }
   });
+
+  ws.on('close', (id, reason) => {
+    console.log('disconnected', id, reason);
+  });
+});
+
+const pingInterval = setInterval(() => {
+  wss.clients.forEach(function each(ws) {
+    if (ws.isAlive === false) {
+      console.log('socket didn\'t respond to ping, terminating');
+      return ws.terminate();
+    }
+
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+/**
+ * Tracks live socket connections to determine when there are no longer active sockets for a certain CC.
+ *
+ * TODO send a Discord message to subscribed channels when no longer live.
+ */
+const liveUpdater = setInterval(async () => {
+  const previousConnections = await db.getLiveConnections();
+  const connections = {};
+  for (const ws of wss.clients) {
+    if (ws.cc) {
+      connections[ws.cc] = (connections[ws.cc] || 0) + 1;
+    }
+  }
+
+  for (const cc of Object.keys(previousConnections || {})) {
+    if (!connections[cc]) {
+      console.log(`cc [${cc}] no longer live`);
+    }
+  }
+
+  db.updateLiveConnections(connections);
+}, 3000);
+
+wss.on('close', function close() {
+  clearInterval(pingInterval);
+  clearInterval(liveUpdater);
 });
 
 const PORT = process.env.PORT || 3000;
